@@ -57,6 +57,7 @@ x-db-depend: &db-depend
   depends_on:
     clickhouse:
       condition: service_healthy
+
 services:
   init-clickhouse:
     !!merge <<: *common
@@ -77,13 +78,10 @@ services:
     restart: on-failure
     volumes:
       - ../common/clickhouse/user_scripts:/var/lib/clickhouse/user_scripts/
+
   zookeeper-1:
     !!merge <<: *zookeeper-defaults
     container_name: signoz-zookeeper-1
-    # ports:
-    #   - "2181:2181"
-    #   - "2888:2888"
-    #   - "3888:3888"
     volumes:
       - zookeeper-1:/bitnami/zookeeper
     environment:
@@ -92,13 +90,10 @@ services:
       - ZOO_AUTOPURGE_INTERVAL=1
       - ZOO_ENABLE_PROMETHEUS_METRICS=yes
       - ZOO_PROMETHEUS_METRICS_PORT_NUMBER=9141
+
   clickhouse:
     !!merge <<: *clickhouse-defaults
     container_name: signoz-clickhouse
-    # ports:
-    #   - "9000:9000"
-    #   - "8123:8123"
-    #   - "9181:9181"
     volumes:
       - ../common/clickhouse/config.xml:/etc/clickhouse-server/config.xml
       - ../common/clickhouse/users.xml:/etc/clickhouse-server/users.xml
@@ -106,7 +101,7 @@ services:
       - ../common/clickhouse/user_scripts:/var/lib/clickhouse/user_scripts/
       - ../common/clickhouse/cluster.xml:/etc/clickhouse-server/config.d/cluster.xml
       - clickhouse:/var/lib/clickhouse/
-      # - ../common/clickhouse/storage.xml:/etc/clickhouse-server/config.d/storage.xml
+
   signoz:
     !!merge <<: *db-depend
     image: signoz/signoz:${VERSION:-v0.119.0}
@@ -130,10 +125,12 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
   otel-collector:
     !!merge <<: *db-depend
     image: signoz/signoz-otel-collector:${OTELCOL_TAG:-v0.144.2}
     container_name: signoz-otel-collector
+    user: "0:988"   # root user + docker group GID=988 (fixes docker.sock permission)
     entrypoint:
       - /bin/sh
     command:
@@ -144,17 +141,28 @@ services:
     volumes:
       - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
       - ../common/signoz/otel-collector-opamp-config.yaml:/etc/manager-config.yaml
+      # NEW: Mount Docker socket for docker_stats receiver
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /:/hostfs:ro 
     environment:
       - OTEL_RESOURCE_ATTRIBUTES=host.name=signoz-host,os.type=linux
       - LOW_CARDINAL_EXCEPTION_GROUPING=false
       - SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_DSN=tcp://clickhouse:9000
       - SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_CLUSTER=cluster
       - SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_REPLICATION=true
-      - SIGNOZ_OTEL_COLLECTOR_TIMEOUT=10m
+      - SIGNOZ_OTEL_COLLECTOR_TIMEOUT=10m  
     ports:
       # - "1777:1777"     # pprof extension
       - "4317:4317" # OTLP gRPC receiver
       - "4318:4318" # OTLP HTTP receiver
+      - "24224:24224" # FluentD forward receiver
+    # NEW: Attach to all required networks
+    networks:
+      - signoz-net        # SigNoz internal (ClickHouse, etc.)
+      - erpnext-one       # ERPNext app containers
+      - mariadb-network   # MariaDB database
+      - traefik-public    # Traefik
+
   signoz-telemetrystore-migrator:
     !!merge <<: *db-depend
     image: signoz/signoz-otel-collector:${OTELCOL_TAG:-v0.144.2}
@@ -173,9 +181,25 @@ services:
         /signoz-otel-collector migrate sync up &&
         /signoz-otel-collector migrate async up
     restart: on-failure
+
 networks:
+  # Existing SigNoz internal network
   signoz-net:
     name: signoz-net
+
+  # NEW: External networks from frappe_docker
+  erpnext-one:
+    name: erpnext-one
+    external: true
+
+  mariadb-network:
+    name: mariadb-network
+    external: true
+
+  traefik-public:
+    name: traefik-public
+    external: true
+
 volumes:
   clickhouse:
     name: signoz-clickhouse

@@ -5,6 +5,7 @@ connectors:
       - name: service.name
       - name: deployment.environment
       - name: host.name
+
 receivers:
   otlp:
     protocols:
@@ -12,17 +13,80 @@ receivers:
         endpoint: 0.0.0.0:4317
       http:
         endpoint: 0.0.0.0:4318
+
+  # --- Prometheus scrape jobs ---
   prometheus:
     config:
       global:
         scrape_interval: 60s
       scrape_configs:
+        # Existing: OTel Collector self-metrics
         - job_name: otel-collector
           static_configs:
-          - targets:
-              - localhost:8888
-            labels:
-              job_name: otel-collector
+            - targets:
+                - localhost:8888
+              labels:
+                job_name: otel-collector
+
+        # Traefik metrics
+        - job_name: traefik
+          scrape_interval: 30s
+          static_configs:
+            - targets:
+                - traefik-traefik-1:8082
+              labels:
+                job_name: traefik
+
+  # MariaDB metrics
+  mysql:
+    endpoint: mariadb-database:3306
+    username: otel_monitor
+    password: monitor        # <-- Replace with your actual password
+    collection_interval: 30s
+    initial_delay: 1s
+
+  # Docker container metrics
+  docker_stats:
+    endpoint: unix:///var/run/docker.sock
+    collection_interval: 30s
+    timeout: 20s
+    api_version: "1.44"
+
+  fluentforward:
+    endpoint: 0.0.0.0:24224
+
+  # HTTP endpoint monitoring
+  httpcheck:
+    targets:
+      - endpoint: https://monitor.vantageo.com/
+        method: GET
+    collection_interval: 300s  # 5 minutes
+
+  # =============================================
+  # HOST METRICS (NEW)
+  # root_path is required when running in Docker.
+  # The host filesystem is mounted at /hostfs.
+  # =============================================
+  hostmetrics:
+    root_path: /hostfs
+    collection_interval: 60s
+    scrapers:
+      cpu: {}
+      disk: {}
+      load: {}
+      filesystem: {}
+      memory: {}
+      network: {}
+      nfs: {}            # Linux only
+      paging: {}
+      process:
+        mute_process_name_error: true
+        mute_process_exe_error: true
+        mute_process_io_error: true
+        mute_process_user_error: true
+      processes: {}
+      system: {}
+
 processors:
   batch:
     send_batch_size: 10000
@@ -39,7 +103,7 @@ processors:
   signozspanmetrics/delta:
     metrics_exporter: signozclickhousemetrics
     metrics_flush_interval: 60s
-    latency_histogram_buckets: [100us, 1ms, 2ms, 6ms, 10ms, 50ms, 100ms, 250ms, 500ms, 1000ms, 1400ms, 2000ms, 5s, 10s, 20s, 40s, 60s ]
+    latency_histogram_buckets: [100us, 1ms, 2ms, 6ms, 10ms, 50ms, 100ms, 250ms, 500ms, 1000ms, 1400ms, 2000ms, 5s, 10s, 20s, 40s, 60s]
     dimensions_cache_size: 100000
     aggregation_temporality: AGGREGATION_TEMPORALITY_DELTA
     enable_exp_histogram: true
@@ -48,9 +112,6 @@ processors:
         default: default
       - name: deployment.environment
         default: default
-      # This is added to ensure the uniqueness of the timeseries
-      # Otherwise, identical timeseries produced by multiple replicas of
-      # collectors result in incorrect APM metrics
       - name: signoz.collector.id
       - name: service.version
       - name: browser.platform
@@ -61,11 +122,13 @@ processors:
       - name: host.name
       - name: host.type
       - name: container.name
+
 extensions:
   health_check:
     endpoint: 0.0.0.0:13133
   pprof:
     endpoint: 0.0.0.0:1777
+
 exporters:
   clickhousetraces:
     datasource: tcp://clickhouse:9000/signoz_traces
@@ -88,6 +151,7 @@ exporters:
     dsn: tcp://clickhouse:9000/signoz_metadata
     enabled: true
     timeout: 45s
+
 service:
   telemetry:
     logs:
@@ -100,18 +164,51 @@ service:
       receivers: [otlp]
       processors: [signozspanmetrics/delta, batch]
       exporters: [clickhousetraces, metadataexporter, signozmeter]
+
     metrics:
       receivers: [otlp]
       processors: [batch]
       exporters: [signozclickhousemetrics, metadataexporter, signozmeter]
+
+    # Prometheus pipeline — handles OTel Collector self-metrics + Traefik scrape
     metrics/prometheus:
       receivers: [prometheus]
       processors: [batch]
       exporters: [signozclickhousemetrics, metadataexporter, signozmeter]
+
+    # MariaDB metrics pipeline
+    metrics/mysql:
+      receivers: [mysql]
+      processors: [batch]
+      exporters: [signozclickhousemetrics, metadataexporter, signozmeter]
+
+    # Docker container metrics pipeline
+    metrics/docker:
+      receivers: [docker_stats]
+      processors: [batch]
+      exporters: [signozclickhousemetrics, metadataexporter, signozmeter]
+
+    # HTTP endpoint monitoring pipeline
+    metrics/httpcheck:
+      receivers: [httpcheck]
+      processors: [batch]
+      exporters: [signozclickhousemetrics, metadataexporter, signozmeter]
+
+    # =============================================
+    # HOST METRICS PIPELINE (NEW)
+    # resourcedetection must come before batch so
+    # host.name is attached before metrics are sent.
+    # =============================================
+    metrics/hostmetrics:
+      receivers: [hostmetrics]
+      processors: [resourcedetection, batch]
+      exporters: [signozclickhousemetrics, metadataexporter, signozmeter]
+
     logs:
-      receivers: [otlp]
+      receivers: [otlp, fluentforward]
       processors: [batch]
       exporters: [clickhouselogsexporter, metadataexporter, signozmeter]
+
     metrics/meter:
       receivers: [signozmeter]
       processors: [batch/meter]
